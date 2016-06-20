@@ -35,11 +35,7 @@ requirements:
 options:
    name:
      description:
-        - Name of the Network
-     required: false
-   id:
-     description:
-        - ID of the Network
+        - Name or ID of the Network
      required: false
    filters:
      description:
