@@ -5,7 +5,6 @@
 # (c) 2013, Dylan Martin <dmartin@seattlecentral.edu>
 # (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
 # (c) 2016, Dag Wieers <dag@wieers.com>
-# (c) 2016, Virgil Dupras <hsoft@hardcoded.net>
 #
 # This file is part of Ansible
 #
@@ -29,12 +28,12 @@ version_added: 1.4
 short_description: Unpacks an archive after (optionally) copying it from the local machine.
 extends_documentation_fragment: files
 description:
-     - The M(unarchive) module unpacks an archive. By default, it will copy the source file from the local system to the target before unpacking - set copy=no to unpack an archive which already exists on the target..
+     - The M(unarchive) module unpacks an archive. By default, it will copy the source file from the local system to the target before unpacking - set remote_src=yes to unpack an archive which already exists on the target..
 options:
   src:
     description:
-      - If copy=yes (default), local path to archive file to copy to the target server; can be absolute or relative. If copy=no, path on the target server to existing archive file to unpack.
-      - If copy=no and src contains ://, the remote machine will download the file from the url first. (version_added 2.0)
+      - If remote_src=no (default), local path to archive file to copy to the target server; can be absolute or relative. If remote_src=yes, path on the target server to existing archive file to unpack.
+      - If remote_src=yes and src contains ://, the remote machine will download the file from the url first. (version_added 2.0)
     required: true
     default: null
   dest:
@@ -45,6 +44,8 @@ options:
   copy:
     description:
       - "If true, the file is copied from local 'master' to the target machine, otherwise, the plugin will look for src archive at the target machine."
+      - "This option has been deprecated in favor of C(remote_src)"
+      - "This option is mutually exclusive with C(remote_src)."
     required: false
     choices: [ "yes", "no" ]
     default: "yes"
@@ -79,15 +80,23 @@ options:
     default:
     required: false
     version_added: "2.1"
+  remote_src:
+    description:
+      - "Set to C(yes) to indicate the archived file is already on the remote system and not local to the Ansible controller."
+      - "This option is mutually exclusive with C(copy)."
+    required: false
+    default: "no"
+    choices: ["yes", "no"]
+    version_added: "2.2"
   validate_certs:
-      description:
-        - This only applies if using a https url as the source of the file.
-        - This should only set to C(no) used on personally controlled sites using self-signed cer
-        - Prior to 2.2 the code worked as if this was set to C(yes).
-      required: false
-      default: "yes"
-      choices: ["yes", "no"]
-      version_added: "2.2"
+    description:
+      - This only applies if using a https url as the source of the file.
+      - This should only set to C(no) used on personally controlled sites using self-signed cer
+      - Prior to 2.2 the code worked as if this was set to C(yes).
+    required: false
+    default: "yes"
+    choices: ["yes", "no"]
+    version_added: "2.2"
 author: "Dag Wieers (@dagwieers)"
 todo:
     - re-implement tar support using native tarfile module
@@ -109,10 +118,10 @@ EXAMPLES = '''
 - unarchive: src=foo.tgz dest=/var/lib/foo
 
 # Unarchive a file that is already on the remote machine
-- unarchive: src=/tmp/foo.zip dest=/usr/local/bin copy=no
+- unarchive: src=/tmp/foo.zip dest=/usr/local/bin remote_src=yes
 
 # Unarchive a file that needs to be downloaded (added in 2.0)
-- unarchive: src=https://example.com/example.zip dest=/usr/local/bin copy=no
+- unarchive: src=https://example.com/example.zip dest=/usr/local/bin remote_src=yes
 '''
 
 import re
@@ -123,9 +132,8 @@ import grp
 import datetime
 import time
 import binascii
+import codecs
 from zipfile import ZipFile, BadZipfile
-import tarfile
-import subprocess
 
 # String from tar that shows the tar contents are different from the
 # filesystem
@@ -314,13 +322,19 @@ class ZipArchive(object):
             change = False
 
             pcs = line.split(None, 7)
+            if len(pcs) != 8:
+                # Too few fields... probably a piece of the header or footer
+                continue
 
             # Check first and seventh field in order to skip header/footer
             if len(pcs[0]) != 7 and len(pcs[0]) != 10: continue
             if len(pcs[6]) != 15: continue
 
+            if pcs[0][0] not in 'dl-?' or not frozenset(pcs[0][1:]).issubset('rwxst-'):
+                continue
+
             ztype = pcs[0][0]
-            permstr = pcs[0][1:10]
+            permstr = pcs[0][1:]
             version = pcs[1]
             ostype = pcs[2]
             size = int(pcs[3])
@@ -394,6 +408,9 @@ class ZipArchive(object):
 
             itemized = list('.%s.......??' % ftype)
 
+            # Note: this timestamp calculation has a rounding error
+            # somewhere... unzip and this timestamp can be one second off
+            # When that happens, we report a change and re-unzip the file
             dt_object = datetime.datetime(*(time.strptime(pcs[6], '%Y%m%d.%H%M%S')[0:6]))
             timestamp = time.mktime(dt_object.timetuple())
 
@@ -434,16 +451,24 @@ class ZipArchive(object):
 
             # Do not handle permissions of symlinks
             if ftype != 'L':
+
+                # Use the new mode provided with the action, if there is one
+                if self.file_args['mode']:
+                    if isinstance(self.file_args['mode'], int):
+                        mode = self.file_args['mode']
+                    else:
+                        try:
+                            mode = int(self.file_args['mode'], 8)
+                        except Exception:
+                            e = get_exception()
+                            self.module.fail_json(path=path, msg="mode %(mode)s must be in octal form" % self.file_args, details=str(e))
                 # Only special files require no umask-handling
-                if ztype == '?':
+                elif ztype == '?':
                     mode = self._permstr_to_octal(permstr, 0)
                 else:
                     mode = self._permstr_to_octal(permstr, umask)
-                if self.file_args['mode'] and  self.file_args['mode'] != stat.S_IMODE(st.st_mode):
-                    change = True
-                    err += 'Path %s differs in permissions (%o vs %o)\n' % (path, self.file_args['mode'], stat.S_IMODE(st.st_mode))
-                    itemized[5] = 'p'
-                elif mode != stat.S_IMODE(st.st_mode):
+
+                if mode != stat.S_IMODE(st.st_mode):
                     change = True
                     itemized[5] = 'p'
                     err += 'Path %s differs in permissions (%o vs %o)\n' % (path, mode, stat.S_IMODE(st.st_mode))
@@ -543,23 +568,25 @@ class TgzArchive(object):
         self.compress_mode = 'gz'
         self._files_in_archive = []
 
-    def _get_tar_fileobj(self):
-        """Returns a file object that can be read by ``tarfile.open()``."""
-        return open(self.src, 'rb')
-
     @property
     def files_in_archive(self, force_refresh=False):
         if self._files_in_archive and not force_refresh:
             return self._files_in_archive
 
-        # The use of Python's tarfile module here allows us to easily avoid tricky file encoding
-        # problems. Ref #11348
-        try:
-            tf = tarfile.open(fileobj=self._get_tar_fileobj(), mode='r:%s' % self.compress_mode)
-        except Exception:
+        cmd = '%s -t%s' % (self.cmd_path, self.zipflag)
+        if self.opts:
+            cmd += ' ' + ' '.join(self.opts)
+        if self.excludes:
+            cmd += ' --exclude="' + '" --exclude="'.join(self.excludes) + '"'
+        cmd += ' -f "%s"' % self.src
+        rc, out, err = self.module.run_command(cmd)
+        if rc != 0:
             raise UnarchiveError('Unable to list files in the archive')
 
-        for filename in tf.getnames():
+        for filename in out.splitlines():
+            # Compensate for locale-related problems in gtar output (octal unicode representation) #11348
+#            filename = filename.decode('string_escape')
+            filename = codecs.escape_decode(filename)[0]
             if filename and filename not in self.excludes:
                 self._files_in_archive.append(filename)
         return self._files_in_archive
@@ -664,19 +691,6 @@ class TarXzArchive(TgzArchive):
         self.zipflag = 'J'
         self.compress_mode = ''
 
-    def _get_tar_fileobj(self):
-        # Python's tarfile module doesn't support xz compression so we have to manually uncompress
-        # it first.
-        xz_bin_path = self.module.get_bin_path('xz')
-        xz_stdout = tempfile.TemporaryFile()
-        # we don't use self.module.run_command() to avoid loading the whole archive in memory.
-        cmd = subprocess.Popen([xz_bin_path, '-dc', self.src], stdout=xz_stdout)
-        rc = cmd.wait()
-        if rc != 0:
-            raise UnarchiveError("Could not uncompress with xz")
-        xz_stdout.seek(0)
-        return xz_stdout
-
 
 # try handlers in order and return the one that works or bail if none work
 def pick_handler(src, dest, file_args, module):
@@ -695,7 +709,8 @@ def main():
             src               = dict(required=True, type='path'),
             original_basename = dict(required=False, type='str'), # used to handle 'dest is a directory' via template, a slight hack
             dest              = dict(required=True, type='path'),
-            copy              = dict(default=True, type='bool'),
+            copy              = dict(required=False, default=True, type='bool'),
+            remote_src        = dict(required=False, default=False, type='bool'),
             creates           = dict(required=False, type='path'),
             list_files        = dict(required=False, default=False, type='bool'),
             keep_newer        = dict(required=False, default=False, type='bool'),
@@ -704,19 +719,22 @@ def main():
             validate_certs    = dict(required=False, default=True, type='bool'),
         ),
         add_file_common_args = True,
-#        supports_check_mode = True,
+        mutually_exclusive   = [("copy", "remote_src"),]
+        # check-mode only works for zip files
+        #supports_check_mode = True,
     )
 
     # We screenscrape a huge amount of commands so use C locale anytime we do
     module.run_command_environ_update = dict(LANG='C', LC_ALL='C', LC_MESSAGES='C', LC_CTYPE='C')
 
-    src    = os.path.expanduser(module.params['src'])
-    dest   = os.path.expanduser(module.params['dest'])
-    copy   = module.params['copy']
+    src        = os.path.expanduser(module.params['src'])
+    dest       = os.path.expanduser(module.params['dest'])
+    copy       = module.params['copy']
+    remote_src = module.params['remote_src']
     file_args = module.load_file_common_arguments(module.params)
     # did tar file arrive?
     if not os.path.exists(src):
-        if copy:
+        if not remote_src or copy:
             module.fail_json(msg="Source '%s' failed to transfer" % src)
         # If copy=false, and src= contains ://, try and download the file to a temp directory.
         elif '://' in src:

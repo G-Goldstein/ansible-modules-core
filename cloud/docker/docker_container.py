@@ -40,9 +40,15 @@ options:
       - List of capabilities to add to the container.
     default: null
     required: false
+  cleanup:
+    description:
+      - Use with I(detach) to remove the container after successful execution.
+    default: false
+    required: false
+    version_added: 2.2
   command:
     description:
-      - Command or list of commands to execute in the container when it starts.
+      - Command to execute when the container starts.
     default: null
     required: false
   cpu_period:
@@ -107,7 +113,7 @@ options:
     required: false
   entrypoint:
     description:
-      - String or list of commands that overwrite the default ENTRYPOINT of the image.
+      - Command that overwrites the default ENTRYPOINT of the image.
     default: null
     required: false
   etc_hosts:
@@ -120,7 +126,7 @@ options:
     description:
       - List of additional container ports to expose for port mappings or links.
         If the port is already exposed using EXPOSE in a Dockerfile, it does not
-        need to be xposed again.
+        need to be exposed again.
     default: null
     required: false
     aliases:
@@ -202,7 +208,7 @@ options:
       - fluentd
       - awslogs
       - splunk
-    defult: json-file
+    default: json-file
     required: false
   log_options:
     description:
@@ -425,7 +431,7 @@ options:
     required: false
   volume_driver:
     description:
-      - The container's volume driver.
+      - The container volume driver.
     default: none
     required: false
   volumes_from:
@@ -586,7 +592,11 @@ EXAMPLES = '''
 
 RETURN = '''
 ansible_docker_container:
-    description: Facts representing the current state of the container. Note that facts are not part of registered vars but accessible directly.
+    description:
+      - Facts representing the current state of the container. Matches the docker inspection output.
+      - Note that facts are not part of registered vars but accessible directly.
+      - Empty if C(state) is I(absent)
+      - If detached is I(False), will include Output attribute containing any output from container run.
     returned: always
     type: dict
     sample: '{
@@ -655,6 +665,7 @@ class TaskParameters(DockerBaseClass):
 
         self.blkio_weight = None
         self.capabilities = None
+        self.cleanup = None
         self.command = None
         self.cpu_period = None
         self.cpu_quota = None
@@ -727,14 +738,15 @@ class TaskParameters(DockerBaseClass):
                 except ValueError as exc:
                     self.fail("Failed to convert %s to bytes: %s" % (param_name, exc))
 
+        self.publish_all_ports = False
         self.published_ports = self._parse_publish_ports()
-        self.ports = self._parse_exposed_ports(self.published_ports)
-        self.log("expose ports:")
-        self.log(self.ports, pretty_print=True)
-        self.publish_all_ports = None
         if self.published_ports == 'all':
             self.publish_all_ports = True
             self.published_ports = None
+
+        self.ports = self._parse_exposed_ports(self.published_ports)
+        self.log("expose ports:")
+        self.log(self.ports, pretty_print=True)
 
         self.links = self._parse_links(self.links)
 
@@ -1017,7 +1029,7 @@ class TaskParameters(DockerBaseClass):
 
     def _parse_ulimits(self):
         '''
-        Turn ulimits into a dictionary
+        Turn ulimits into an array of Ulimit objects
         '''
         if self.ulimits is None:
             return None
@@ -1029,6 +1041,7 @@ class TaskParameters(DockerBaseClass):
             if len(pieces) >= 2:
                 limits['name'] = pieces[0]
                 limits['soft'] = int(pieces[1])
+                limits['hard'] = int(pieces[1])
             if len(pieces) == 3:
                 limits['hard'] = int(pieces[2])
             try:
@@ -1124,7 +1137,7 @@ class Container(DockerBaseClass):
         Diff parameters vs existing container config. Returns tuple: (True | False, List of differences)
         '''
         self.log('Starting has_different_configuration')
-        self.parameters.expected_entrypoint = self._get_expected_entrypoint(image)
+        self.parameters.expected_entrypoint = self._get_expected_entrypoint()
         self.parameters.expected_links = self._get_expected_links()
         self.parameters.expected_ports = self._get_expected_ports()
         self.parameters.expected_exposed = self._get_expected_exposed(image)
@@ -1147,7 +1160,6 @@ class Container(DockerBaseClass):
         restart_policy = host_config.get('RestartPolicy', dict())
         config = self.container['Config']
         network = self.container['NetworkSettings']
-        host_config['Ulimits'] = self._get_expected_ulimits(host_config['Ulimits'])
 
         # The previous version of the docker module ignored the detach state by
         # assuming if the container was running, it must have been detached.
@@ -1383,20 +1395,14 @@ class Container(DockerBaseClass):
                     extra_networks.append(dict(name=network, id=network_config['NetworkID']))
         return extra, extra_networks
 
-    def _get_expected_entrypoint(self, image):
+    def _get_expected_entrypoint(self):
         self.log('_get_expected_entrypoint')
-        if isinstance(self.parameters.entrypoint, list):
-            entrypoint = self.parameters.entrypoint
-        else:
-            entrypoint = []
-        if image and image['ContainerConfig'].get('Entrypoint'):
-            entrypoint = list(set(entrypoint + image['ContainerConfig'].get('Entrypoint')))
-        if len(entrypoint) == 0:
+        if not self.parameters.entrypoint:
             return None
-        return entrypoint
+        return shlex.split(self.parameters.entrypoint)
 
     def _get_expected_ports(self):
-        if self.parameters.published_ports is None:
+        if not self.parameters.published_ports:
             return None
         expected_bound_ports = {}
         for container_port, config in self.parameters.published_ports.iteritems():
@@ -1406,7 +1412,7 @@ class Container(DockerBaseClass):
                 expected_bound_ports[container_port] = [{'HostIp': "0.0.0.0", 'HostPort': ""}]
             elif isinstance(config[0], tuple):
                 expected_bound_ports[container_port] = []
-                for host_ip, host_port in config.iteritems():
+                for host_ip, host_port in config:
                     expected_bound_ports[container_port].append({ 'HostIp': host_ip, 'HostPort': str(host_port)})
             else:
                 expected_bound_ports[container_port] = [{'HostIp': config[0], 'HostPort': str(config[1])}]
@@ -1530,20 +1536,13 @@ class Container(DockerBaseClass):
         self.log('_get_expected_ulimits')
         if config_ulimits is None:
             return None
-
         results = []
-        if isinstance(config_ulimits[0], Ulimit):
-            for limit in config_ulimits:
-                if limit.hard:
-                    results.append("%s:%s" % (limit.name, limit.soft, limit.hard))
-                else:
-                    results.append("%s:%s" % (limit.name, limit.soft))
-        else:
-            for limit in config_ulimits:
-                if limit.get('hard'):
-                    results.append("%s:%s" % (limit.get('name'), limit.get('hard')))
-                else:
-                    results.append("%s:%s" % (limit.get('name'), limit.get('soft')))
+        for limit in config_ulimits:
+            results.append(dict(
+                Name=limit.name,
+                Soft=limit.soft,
+                Hard=limit.hard
+            ))
         return results
 
     def _get_expected_cmd(self):
@@ -1695,7 +1694,7 @@ class ContainerManager(DockerBaseClass):
             if self.diff.get('differences'):
                 self.diff['differences'].append(dict(network_differences=network_differences))
             else:
-                self.diff['differences'] = dict(network_differences=network_differences)
+                self.diff['differences'] = [dict(network_differences=network_differences)]
             self.results['changed'] = True
             updated_container = self._add_networks(container, network_differences)
 
@@ -1705,7 +1704,7 @@ class ContainerManager(DockerBaseClass):
                 if self.diff.get('differences'):
                     self.diff['differences'].append(dict(purge_networks=extra_networks))
                 else:
-                    self.diff['differences'] = dict(purge_networks=extra_networks)
+                    self.diff['differences'] = [dict(purge_networks=extra_networks)]
                 self.results['changed'] = True
                 updated_container = self._purge_networks(container, extra_networks)
         return updated_container
@@ -1741,7 +1740,7 @@ class ContainerManager(DockerBaseClass):
     def _purge_networks(self, container, networks):
         for network in networks:
             self.results['actions'].append(dict(removed_from_network=network['name']))
-            if not self.check_mode:
+            if not self.check_mode and network.get('id'):
                 try:
                     self.client.disconnect_container_from_network(container.Id, network['id'])
                 except Exception as exc:
@@ -1776,10 +1775,17 @@ class ContainerManager(DockerBaseClass):
 
             if not self.parameters.detach:
                 status = self.client.wait(container_id)
+                output = self.client.logs(container_id, stdout=True, stderr=True, stream=False, timestamps=False)
                 if status != 0:
-                    output = self.client.logs(container_id, stdout=True, stderr=True, stream=False, timestamps=False)
                     self.fail(output, status=status)
-
+                if self.parameters.cleanup:
+                    self.container_remove(container_id, force=True)
+                insp = self._get_container(container_id)
+                if insp.raw:
+                    insp.raw['Output'] = output
+                else:
+                    insp.raw = dict(Output=output)
+                return insp
         return self._get_container(container_id)
 
     def container_remove(self, container_id, link=False, force=False):
@@ -1844,6 +1850,7 @@ def main():
     argument_spec = dict(
         blkio_weight=dict(type='int'),
         capabilities=dict(type='list'),
+        cleanup=dict(type='bool', default=False),
         command=dict(type='str'),
         cpu_period=dict(type='int'),
         cpu_quota=dict(type='int'),
@@ -1857,7 +1864,7 @@ def main():
         dns_search_domains=dict(type='list'),
         env=dict(type='dict'),
         env_file=dict(type='path'),
-        entrypoint=dict(type='list'),
+        entrypoint=dict(type='str'),
         etc_hosts=dict(type='dict'),
         exposed_ports=dict(type='list', aliases=['exposed', 'expose']),
         force_kill=dict(type='bool', default=False, aliases=['forcekill']),

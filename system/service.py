@@ -780,24 +780,23 @@ class LinuxService(Service):
                     action = 'enable'
                     klinks = glob.glob('/etc/rc?.d/K??' + self.name)
                     if not klinks:
-                        (rc, out, err) = self.execute_command("%s %s defaults"  % (self.enable_cmd, self.name))
-                        if rc != 0:
-                            if err:
-                                self.module.fail_json(msg=err)
-                            else:
-                                self.module.fail_json(msg=out) % (self.enable_cmd, self.name, action)
+                        if not self.module.check_mode:
+                            (rc, out, err) = self.execute_command("%s %s defaults"  % (self.enable_cmd, self.name))
+                            if rc != 0:
+                                if err:
+                                    self.module.fail_json(msg=err)
+                                else:
+                                    self.module.fail_json(msg=out) % (self.enable_cmd, self.name, action)
                 else:
                     action = 'disable'
 
-                if self.module.check_mode:
-                    rc = 0
-                    return
-                (rc, out, err) = self.execute_command("%s %s %s"  % (self.enable_cmd, self.name, action))
-                if rc != 0:
-                    if err:
-                        self.module.fail_json(msg=err)
-                    else:
-                        self.module.fail_json(msg=out) % (self.enable_cmd, self.name, action)
+                if not self.module.check_mode:
+                    (rc, out, err) = self.execute_command("%s %s %s"  % (self.enable_cmd, self.name, action))
+                    if rc != 0:
+                        if err:
+                            self.module.fail_json(msg=err)
+                        else:
+                            self.module.fail_json(msg=out) % (self.enable_cmd, self.name, action)
             else:
                 self.changed = False
 
@@ -944,9 +943,10 @@ class FreeBsdService(Service):
 
     def get_service_tools(self):
         self.svc_cmd = self.module.get_bin_path('service', True)
-
         if not self.svc_cmd:
             self.module.fail_json(msg='unable to find service binary')
+
+        self.sysrc_cmd = self.module.get_bin_path('sysrc')
 
     def get_service_status(self):
         rc, stdout, stderr = self.execute_command("%s %s %s %s" % (self.svc_cmd, self.name, 'onestatus', self.arguments))
@@ -992,10 +992,32 @@ class FreeBsdService(Service):
         if self.rcconf_key is None:
             self.module.fail_json(msg="unable to determine rcvar", stdout=stdout, stderr=stderr)
 
-        try:
-            return self.service_enable_rcconf()
-        except Exception:
-            self.module.fail_json(msg='unable to set rcvar')
+        if self.sysrc_cmd: # FreeBSD >= 9.2
+
+            rc, current_rcconf_value, stderr = self.execute_command("%s -n %s" % (self.sysrc_cmd, self.rcconf_key))
+            if rc != 0:
+                self.module.fail_json(msg="unable to get current rcvar value", stdout=stdout, stderr=stderr)
+
+            if current_rcconf_value.strip().upper() != self.rcconf_value:
+
+                self.changed = True
+
+                if self.module.check_mode:
+                    self.module.exit_json(changed=True, msg="changing service enablement")
+
+                rc, stdout, stderr = self.execute_command("%s %s=\"%s\"" % (self.sysrc_cmd, self.rcconf_key, self.rcconf_value ) )
+                if rc != 0:
+                    self.module.fail_json(msg="unable to set rcvar using sysrc", stdout=stdout, stderr=stderr)
+
+            else:
+                self.changed = False
+
+        else: # Legacy (FreeBSD < 9.2)
+            try:
+                return self.service_enable_rcconf()
+            except Exception:
+                self.module.fail_json(msg='unable to set rcvar')
+
 
     def service_control(self):
 
